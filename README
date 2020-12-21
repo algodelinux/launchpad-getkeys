@@ -1,0 +1,31 @@
+This is a modified version of launchpad-getkeys from Saurabh Kumar
+(see https://github.com/sa1/launchpad-getkeys) made by Esteban M. Navas 
+
+The changes have been merged back.
+
+This version can use a config file /etc/default/launchpad-getkeys:
+# Defaults for launchpad-getkeys
+
+# Define a proxy server if you need to bypass a firewall to update keys
+# SERVER=servidor
+
+# Define a proxy server port if you need to bypass a firewall to update keys
+# PORT=3128
+
+# Remove expired keys:
+# REMOVE_EXPIRED_KEYS=no  : don't remove expired keys (option by default)
+# REMOVE_EXPIRED_KEYS=yes : remove all expired keys
+
+If the file don't exists or proxy server is unreacheable, launchpad-getkeys will ignore it.
+
+Usage:   
+
+  launchpad-getkeys (as root)
+  sudo launchpad-getkeys (as users with sudoers permissions)
+
+Parameters:   
+
+   * use without any parameter to automatically import all the missing GPG keys.
+   * -k SERVER:PORT will pass a new keyserver, in case the default keyserver is down.
+   * -p PROXY:PORT lets you specify a proxy-server other than the default one.
+   * -r remove all expired keys.
