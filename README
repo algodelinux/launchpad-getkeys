@@ -16,6 +16,12 @@ This version can use a config file /etc/default/launchpad-getkeys:
 # REMOVE_EXPIRED_KEYS=no  : don't remove expired keys (option by default)
 # REMOVE_EXPIRED_KEYS=yes : remove all expired keys
 
+# New vars introduced to let remove apt keys without use apt-key wich is deprecated
+# Old apt keys file
+# OLDKEYFILE="/etc/apt/trusted.gpg"
+# apt keys directories
+# KEYPATHS="/usr/share/keyrings /etc/apt/keyrings /etc/apt/trusted.gpg.d"
+
 If the file don't exists or proxy server is unreacheable, launchpad-getkeys will ignore it.
 
 Usage:   

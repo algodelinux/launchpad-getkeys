@@ -13,3 +13,9 @@ PORT=3128
 # REMOVE_EXPIRED_KEYS=yes : remove all expired keys
 REMOVE_EXPIRED_KEYS=no
 
+# New vars introduced to let remove apt keys without use apt-key wich is deprecated
+# Old apt keys file
+OLDKEYFILE="/etc/apt/trusted.gpg"
+# apt keys directories
+KEYPATHS="/usr/share/keyrings /etc/apt/keyrings /etc/apt/trusted.gpg.d"
+
