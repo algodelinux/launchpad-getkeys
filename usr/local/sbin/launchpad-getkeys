@@ -1,6 +1,6 @@
 #! /bin/bash
 # Modified version by Esteban M. Navas <algodelinux@gmail.com>
-# Date: 03/04/2025
+# Date: 23/05/2025
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -94,6 +94,10 @@ if [[ $PROXY ]]; then
 	   echo -e "${RED}Error: please enter a proxyserver and a port, like so: sudo launchpad-getkeys -p http://PROXYSERVER:PORT${NC}"
 	   exit 0
 	fi
+fi
+
+if [ "$REMOVE_EXPIRED_KEYS" = "yes" ]; then
+   remove_expired_keys
 fi
 
 echo -e "${GREEN}\nPlease wait... launchpad-getkeys is running an update so
