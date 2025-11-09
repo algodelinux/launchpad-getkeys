@@ -1,7 +1,5 @@
-This is a modified version of launchpad-getkeys from Saurabh Kumar
+This is a rewrited version of launchpad-getkeys from Saurabh Kumar
 (see https://github.com/sa1/launchpad-getkeys) made by Esteban M. Navas 
-
-The changes have been merged back.
 
 This version can use a config file /etc/default/launchpad-getkeys:
 # Defaults for launchpad-getkeys

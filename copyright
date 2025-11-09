@@ -1,22 +1,12 @@
-In this version I've merged modified version made by Saurabh Kumar 
-<saurabhgeek92@gmail.com> with my own version.
-Las modification time: Mon, 21 Dec, 2020 0:00 GMT by Esteban M. Navas 
-<algodelinux@gmail.com>
+This is a rewrited version of launchpad-getkeys 
+Las modification time: Mon, 09 Nov, 2025 0:00 GMT 
+by Esteban M. Navas <algodelinux@gmail.com>
 
-This work is a modification of Alin Andrei's work.
-Modified on Wed, 16 Feb,2011 2:06 GMT
-by Saurabh Kumar <saurabhgeek92@gmail.com>
 All modifications licensed under GPLv3.
-
-Original notice of Alin Andrei's license:
-
-This package was debianized by:
-
-    Alin Andrei <webupd8@gmail.com> on  Fri, 28 May 2010 19:30:38 +0300
 
 Copyright:
 
-    <Copyright (C) 2010 Alin Andrei>
+    <Copyright (C) 2025 Esteban M. Navas Martín>
 
 License:
 
@@ -35,9 +25,3 @@ License:
 
 On Debian systems, the complete text of the GNU General
 Public License version 3 can be found in `/usr/share/common-licenses/GPL-3'.
-
-The Debian packaging is:
-
-    Copyright (C) 2010 Alin Andrei <webupd8@gmail.com>
-
-and is licensed under the GPL version 3, see above.
