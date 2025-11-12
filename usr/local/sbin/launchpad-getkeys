@@ -61,6 +61,31 @@ function remove_expired_keys () {
     rm -f /tmp/expiredkeys
 }
 
+function install_official_keyrings() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        DISTRO_ID=$(echo "$ID" | tr '[:upper:]' '[:lower:]')
+    else
+        DISTRO_ID="debian"  # valor por defecto
+    fi
+
+    case "$DISTRO_ID" in
+        debian)
+            echo "Instalando claves oficiales de Debian..."
+            apt install -y --no-install-recommends \
+                debian-archive-keyring
+            ;;
+        ubuntu)
+            echo "Instalando claves oficiales de Ubuntu..."
+            apt install -y --no-install-recommends \
+                ubuntu-keyring
+            ;;
+        *)
+            echo "Distribución no reconocida, saltando instalación de claves oficiales."
+            ;;
+    esac
+}
+
 function download_key_from_known_sources() {
     local keyid="$1"
     local target="$2"
@@ -117,11 +142,6 @@ function download_key_from_known_sources() {
             wget -qO- "https://pkgs.tailscale.com/stable/${distro}/${codename}.noarmor.gpg" | tee /usr/share/keyrings/tailscale-archive-keyring.gpg > /dev/null 2>&1
             ;;
 
-        # Debian
-        54404762BBB6E853|BDE6D2B9216EC7A8)
-            wget -qO- https://ftp-master.debian.org/keys/archive-key-12.asc | gpg --yes --dearmor > /etc/apt/trusted.gpg.d/debian-archive-12.gpg
-            wget -qO- https://ftp-master.debian.org/keys/archive-key-12-security.asc | gpg --yes --dearmor > /etc/apt/trusted.gpg.d/debian-security-12.gpg
-            ;;
         # Unknown
         *)  return 1
             ;;
@@ -187,6 +207,9 @@ if [[ "$REMOVE_EXPIRED_KEYS" == "yes" ]]; then
     remove_expired_keys
 fi
 
+# Install official keyrings
+install_official_keyrings
+
 mkdir -p "$KEYRING_DIR"
 
 # Remove previous automatic import files
@@ -246,11 +269,10 @@ while read -r repo keys; do
     done
 
     # Final validation: ensure file is valid GPG
-    if [[ -s "$current_repo" && $(gpg --list-packets "$current_repo" >/dev/null 2>&1; echo $?) -eq 0 ]]; then
-        echo -e "${GREEN}✔ All keys successfully saved in ${current_repo}${NC}"
+    if gpg --no-default-keyring --keyring "$current_repo" --list-keys >/dev/null 2>&1; then
+        echo -e "${GREEN}✔ Key(s) successfully saved in ${current_repo}${NC}"
     else
-        echo -e "${RED}✖ Invalid keyring created for ${repo}${NC}"
-        rm -f "$current_repo"
+        echo -e "${RED}✖ Failed to save key(s) for ${repo}${NC}"
     fi
 done | tee /var/log/launchpad-getkeys.log
 
