@@ -1,7 +1,7 @@
 #! /bin/bash
 # launchpad-getkeys
 # Rewrited version by Esteban M. Navas <algodelinux@gmail.com>
-# Last update: 09/11/2025
+# Last update: 12/11/2025
 #
 # Parses the apt log, removes "GPG error:" lines, # extracts NO_PUBKEY and downloads missing keys,
 
@@ -64,7 +64,7 @@ function remove_expired_keys () {
 function download_key_from_known_sources() {
     local keyid="$1"
     local target="$2"
-    
+
     # For testing purposes only
     # echo -e "${CYAN}Trying to download key ${keyid} from known sources...${NC}"
 
@@ -106,7 +106,7 @@ function download_key_from_known_sources() {
 
         # Netdata
         54832F89F09FED90)
-            curl -fsSL https://packagecloud.io/netdata/netdata/gpgkey | gpg --dearmor > /etc/apt/trusted.gpg.d/netdata_netdata.gpg
+            curl -fsSL https://packagecloud.io/netdata/netdata/gpgkey | gpg --yes --dearmor > /etc/apt/trusted.gpg.d/netdata_netdata.gpg
             ;;
 
         # Tailscale
@@ -117,6 +117,11 @@ function download_key_from_known_sources() {
             wget -qO- "https://pkgs.tailscale.com/stable/${distro}/${codename}.noarmor.gpg" | tee /usr/share/keyrings/tailscale-archive-keyring.gpg > /dev/null 2>&1
             ;;
 
+        # Debian
+        54404762BBB6E853|BDE6D2B9216EC7A8)
+            wget -qO- https://ftp-master.debian.org/keys/archive-key-12.asc | gpg --yes --dearmor > /etc/apt/trusted.gpg.d/debian-archive-12.gpg
+            wget -qO- https://ftp-master.debian.org/keys/archive-key-12-security.asc | gpg --yes --dearmor > /etc/apt/trusted.gpg.d/debian-security-12.gpg
+            ;;
         # Unknown
         *)  return 1
             ;;
