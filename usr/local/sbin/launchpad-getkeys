@@ -1,7 +1,7 @@
 #!/bin/bash
 # launchpad-getkeys
 # Rewrited version by Esteban M. Navas <algodelinux@gmail.com>
-# Last update: 13/11/2026 (limpieza de .gpg no referenciados)
+# Last update: 13/11/2026 (fix migrate_keyring stdout & limpieza de .gpg no referenciados)
 #
 # Parses the apt log, removes "GPG error:" lines, extracts NO_PUBKEY and downloads missing keys.
 # deb822 support: keys are saved in /usr/share/keyrings and referenced from
@@ -290,14 +290,12 @@ reference_key_in_sources() {
 #    referenciada, el keyring se conserva y se avisa, para no romper apt.
 clean_trusted_gpg_d() {
     local dir="/etc/apt/trusted.gpg.d"
-    local f fpr keyfile sb sbfile mimetype allsafe fp
+    local f fpr keyfile sb sbfile mimetype allsafe dst
     [ -d "$dir" ] || return 0
     echo -e "${CYAN}Cleaning $dir...${NC}"
 
-    # Huellas de las claves realmente referenciadas desde .sources (Signed-By)
-    # Primero: reapuntar a $KEYRING_DIR las referencias que aún apuntan a
-    # keyrings de trusted.gpg.d que ya han sido migrados, para no dejar
-    # referencias colgantes al borrarlos.
+    # Reapuntar a $KEYRING_DIR las referencias que aún apuntan a keyrings
+    # de trusted.gpg.d que ya han sido migrados
     for f in "$dir"/*; do
         [ -f "$f" ] || continue
         dst="$KEYRING_DIR/$(basename "$f")"
@@ -310,7 +308,9 @@ clean_trusted_gpg_d() {
     done
 
     REFERENCED_FPRS=$(mktemp)
-    for sb in $(grep -h -i '^[[:space:]]*Signed-By:' /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null | sed 's/^[^:]*:[[:space:]]*//'); do
+    while IFS= read -r sb; do
+        sb=$(echo "$sb" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -z "$sb" ] && continue
         # Las referencias a trusted.gpg.d no cuentan: ahí el keyring va a ser eliminado
         [[ "$sb" == "$dir"/* || "$sb" == "/etc/apt/trusted.gpg" ]] && continue
         if [ -d "$sb" ]; then
@@ -320,7 +320,7 @@ clean_trusted_gpg_d() {
         elif [ -f "$sb" ]; then
             LC_ALL=C gpg --no-default-keyring --keyring="$sb" --with-colons --list-keys 2>/dev/null | awk -F: '/^fpr/{print $10}' >> "$REFERENCED_FPRS"
         fi
-    done
+    done < <(grep -h -i '^[[:space:]]*Signed-By:' "$SOURCES_LIST_D"/*.sources /etc/apt/sources.list 2>/dev/null | sed 's/^[^:]*:[[:space:]]*//' | tr ', ' '\n')
     sort -u "$REFERENCED_FPRS" -o "$REFERENCED_FPRS"
 
     for f in "$dir"/*; do
@@ -348,7 +348,7 @@ clean_trusted_gpg_d() {
                 allsafe="no"
                 break
             fi
-            if ! grep -q "^$fpr$" "$REFERENCED_FPRS"; then
+            if ! grep -Fxq "$fpr" "$REFERENCED_FPRS"; then
                 echo -e "${CYAN}Key $fpr exists in $found but is not referenced by any .sources (Signed-By). Keeping $f.${NC}"
                 allsafe="no"
                 break
@@ -367,7 +367,7 @@ clean_trusted_gpg_d() {
 # estén referenciados en ningún .sources (Signed-By) ni .list (signed-by=),
 # protegiendo aquellos que pertenecen a paquetes instalados del sistema (dpkg -S).
 remove_unreferenced_keyrings() {
-    local ref_list dir kf real_kf entry resolved
+    local ref_list dir kf real_kf entry
     echo -e "${CYAN}Checking for unreferenced .gpg keyring files...${NC}"
     ref_list=$(mktemp)
 
@@ -377,7 +377,8 @@ remove_unreferenced_keyrings() {
             | sed 's/^[^:]*:[[:space:]]*//' | tr ', ' '\n'
         grep -h -i '^[[:space:]]*deb' /etc/apt/sources.list "$SOURCES_LIST_D"/*.list 2>/dev/null \
             | grep -Eo 'signed-by=[^] ,]+' | sed 's/^signed-by=//'
-    } | while read -r entry; do
+    } | while IFS= read -r entry; do
+        entry=$(echo "$entry" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [ -z "$entry" ] && continue
         if [ -d "$entry" ]; then
             for f in "$entry"/*.gpg; do
@@ -450,6 +451,8 @@ find_keyring_for_repo() {
 
 # Mueve un keyring de trusted.gpg.d a /usr/share/keyrings. Si ya existe uno
 # con el mismo nombre, concatena los paquetes y elimina el original.
+# IMPORTANTE: el mensaje informativo va a stderr (>&2) para que stdout devuelva
+# exclusivamente la ruta limpia $dst.
 migrate_keyring() {
     local src="$1"
     local dst="$KEYRING_DIR/$(basename "$1")"
@@ -461,9 +464,9 @@ migrate_keyring() {
             mv "$src" "$dst"
             chmod 644 "$dst"
         fi
-        echo -e "${GREEN}✔ Keyring moved to $dst${NC}"
+        echo -e "${GREEN}✔ Keyring moved to $dst${NC}" >&2
     fi
-    echo "$dst"
+    printf '%s\n' "$dst"
 }
 
 # Conversión proactiva (-c): para cada entrada de fuentes sin Signed-By,
@@ -471,7 +474,7 @@ migrate_keyring() {
 # a /usr/share/keyrings, referencia las entradas (convirtiendo a deb822 las
 # one-line) y limpia trusted.gpg.d.
 proactive_convert() {
-    local f line uri suite kf dst mappings
+    local f uri suite kf dst mappings
     echo -e "${CYAN}Proactive conversion to deb822...${NC}"
     mappings=$(mktemp)
 
@@ -482,7 +485,9 @@ proactive_convert() {
             [ -n "$uri" ] && [ -n "$suite" ] || continue
             if kf=$(find_keyring_for_repo "$uri" "$suite"); then
                 dst=$(migrate_keyring "$kf")
-                echo "${uri}|${dst}" >> "$mappings"
+                if [[ "$dst" == /* && -f "$dst" ]]; then
+                    printf '%s|%s\n' "$uri" "$dst" >> "$mappings"
+                fi
             fi
         done < <(awk '
             {
@@ -503,7 +508,9 @@ proactive_convert() {
             [ -n "$uri" ] && [ -n "$suite" ] || continue
             if kf=$(find_keyring_for_repo "$uri" "$suite"); then
                 dst=$(migrate_keyring "$kf")
-                echo "${uri}|${dst}" >> "$mappings"
+                if [[ "$dst" == /* && -f "$dst" ]]; then
+                    printf '%s|%s\n' "$uri" "$dst" >> "$mappings"
+                fi
             fi
         done < <(awk '
             function flush() {
@@ -526,7 +533,7 @@ proactive_convert() {
     # Referenciar cada repositorio con su keyring migrado
     if [ -s "$mappings" ]; then
         while IFS='|' read -r uri dst; do
-            [ -n "$uri" ] || continue
+            [ -n "$uri" ] && [ -n "$dst" ] || continue
             echo -e "${CYAN}==> Referencing $uri with $dst${NC}"
             reference_key_in_sources "$uri" "$dst"
         done < <(sort -u "$mappings")
