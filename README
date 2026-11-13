@@ -33,3 +33,10 @@ Parameters:
    * -k SERVER:PORT will pass a new keyserver, in case the default keyserver is down.
    * -p PROXY:PORT lets you specify a proxy-server other than the default one.
    * -r remove all expired keys.
+   * -f forces an 'apt-get update'.
+   * -c proactive conversion to deb822: migrates trusted.gpg.d
+      keyrings to /usr/share/keyrings, references them and cleans up.
+
+Keys are stored in /usr/share/keyrings and referenced from the
+matching .sources file (deb822). One-line entries (.list) that need a key
+are converted to deb822 format automatically.
