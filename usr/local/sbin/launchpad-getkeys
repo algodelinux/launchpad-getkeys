@@ -33,7 +33,6 @@ function HELP () {
     echo -e "   * ${WHITE}-k SERVER:PORT${NC} specifies an alternative key server."
     echo -e "   * ${WHITE}-p PROXY:PORT${NC} uses an HTTP proxy."
     echo -e "   * ${WHITE}-r${NC} removes expired keys."
-    echo -e "   * ${WHITE}-f${NC} forces an 'apt-get update'."
     echo -e "   * ${WHITE}-c${NC} proactive conversion to deb822: migrates trusted.gpg.d"
     echo -e "      keyrings to /usr/share/keyrings, references them and cleans up.\n"
     echo -e "Keys are stored in ${WHITE}/usr/share/keyrings${NC} and referenced from the"
