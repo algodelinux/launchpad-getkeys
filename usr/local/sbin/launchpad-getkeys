@@ -1,9 +1,16 @@
 #!/bin/bash
 # launchpad-getkeys
 # Rewrited version by Esteban M. Navas <algodelinux@gmail.com>
-# Last update: 30/01/2026
+# Last update: 13/11/2026 (limpieza de .gpg no referenciados)
 #
-# Parses the apt log, removes "GPG error:" lines, # extracts NO_PUBKEY and downloads missing keys,
+# Parses the apt log, removes "GPG error:" lines, extracts NO_PUBKEY and downloads missing keys.
+# deb822 support: keys are saved in /usr/share/keyrings and referenced from
+# the repository's .sources file (Signed-By). Entries in one-line format
+# (.list / sources.list) are converted to deb822 automatically.
+# Option -c: proactive conversion. Even without key errors, it detects which
+# trusted.gpg.d keyring signs each repository (verifying its InRelease), moves
+# the keyring to /usr/share/keyrings, references it (Signed-By), converts the
+# affected one-line entries to deb822 and cleans /etc/apt/trusted.gpg.d.
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -12,9 +19,12 @@ CYAN='\033[36m'
 NC='\033[0m' # No Color
 
 UPDATE_LOG="/tmp/updateresults"
-KEYRING_DIR="/etc/apt/trusted.gpg.d"
+# deb822: las claves ya no deben ir a /etc/apt/trusted.gpg.d, sino a
+# /usr/share/keyrings, referenciadas mediante Signed-By en los .sources
+KEYRING_DIR="/usr/share/keyrings"
 OLDKEYFILE="/etc/apt/trusted.gpg"
 KEYPATHS="/usr/share/keyrings /etc/apt/keyrings /etc/apt/trusted.gpg.d"
+SOURCES_LIST_D="/etc/apt/sources.list.d"
 
 function HELP () {
     echo -e "${WHITE}\nlaunchpad-getkeys${NC} is a utility to automatically import all missing GPG keys from repositories.\n"
@@ -23,7 +33,12 @@ function HELP () {
     echo -e "   * ${WHITE}-k SERVER:PORT${NC} specifies an alternative key server."
     echo -e "   * ${WHITE}-p PROXY:PORT${NC} uses an HTTP proxy."
     echo -e "   * ${WHITE}-r${NC} removes expired keys."
-    echo -e "   * ${WHITE}-f${NC} forces an 'apt-get update'.\n"
+    echo -e "   * ${WHITE}-f${NC} forces an 'apt-get update'."
+    echo -e "   * ${WHITE}-c${NC} proactive conversion to deb822: migrates trusted.gpg.d"
+    echo -e "      keyrings to /usr/share/keyrings, references them and cleans up.\n"
+    echo -e "Keys are stored in ${WHITE}/usr/share/keyrings${NC} and referenced from the"
+    echo -e "matching .sources file (deb822). One-line entries (.list) that need a key"
+    echo -e "are converted to deb822 format automatically.\n"
     exit 0
 }
 
@@ -115,6 +130,432 @@ install_keyring_if_missing() {
     esac
 }
 
+# Normaliza una URI: quita esquema y barras finales, para comparar repos
+normalize_uri() {
+    local uri="$1"
+    uri="${uri#*://}"
+    while [[ "$uri" == */ ]]; do uri="${uri%/}"; done
+    echo "$uri"
+}
+
+# Devuelve 0 si el repositorio $1 (URI base del log de apt) corresponde a la
+# URI de origen $2
+uri_matches_repo() {
+    local repo base
+    repo=$(normalize_uri "$1")
+    base=$(normalize_uri "$2")
+    [[ "$repo" == "$base" || "$repo" == "$base"/* ]]
+}
+
+# Añade "Signed-By: <keyring>" a las stanzas de un archivo .sources cuyas URIs
+# correspondan al repositorio dado y que aún no tengan Signed-By
+add_signed_by() {
+    local f="$1" repo="$2" keyring="$3"
+    local tmp
+    tmp=$(mktemp)
+
+    awk -v repo="$repo" -v keyring="$keyring" '
+        function norm(s) { sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", s); sub(/\/+$/, "", s); return s }
+        function uris_match(line,   u, n, a, i) {
+            u = line; sub(/^[Uu][Rr][Ii][Ss]:[ \t]*/, "", u)
+            n = split(u, a, /[ \t]+/)
+            r = norm(repo)
+            for (i = 1; i <= n; i++) {
+                bu = norm(a[i])
+                if (bu == r || index(r "/", bu "/") == 1) return 1
+            }
+            return 0
+        }
+        BEGIN { instanza = 0; matchstanza = 0; hassb = 0 }
+        function closesb() { if (instanza && matchstanza && !hassb) print "Signed-By: " keyring }
+        {
+            if ($0 ~ /^[ \t]*$/) {
+                closesb()
+                print
+                instanza = 0; matchstanza = 0; hassb = 0
+                next
+            }
+            if ($0 ~ /^[ \t]*[Tt][Yy][Pp][Ee][Ss]:/) {
+                closesb()
+                instanza = 1; matchstanza = 0; hassb = 0
+            } else if (instanza && $0 ~ /^[ \t]*[Uu][Rr][Ii][Ss]:/) {
+                if (uris_match($0)) matchstanza = 1
+            } else if (instanza && $0 ~ /^[ \t]*[Ss][Ii][Gg][Nn][Ee][Dd]-[Bb][Yy]:/) {
+                hassb = 1
+            }
+            print
+        }
+        END { closesb() }
+    ' "$f" > "$tmp"
+
+    if ! diff -q "$f" "$tmp" >/dev/null 2>&1; then
+        mv "$tmp" "$f"
+        echo -e "${GREEN}✔ Signed-By añadido en $f${NC}"
+    else
+        rm -f "$tmp"
+    fi
+}
+
+# Convierte a deb822 las entradas one-line (deb/deb-src) del archivo $1 que
+# correspondan al repositorio $2, escribiéndolas en un .sources con
+# Signed-By: $3, y comentando las líneas originales
+convert_list_entries() {
+    local listfile="$1" repo="$2" keyring="$3"
+    local repoclean outfile tmp_list tmp_out
+    repoclean=$(normalize_uri "$repo"); repoclean="${repoclean//\//-}"
+    outfile="$SOURCES_LIST_D/launchpad-getkeys_imported____${repoclean}.sources"
+    tmp_list=$(mktemp)
+    tmp_out=$(mktemp)
+
+    awk -v repo="$repo" -v keyring="$keyring" -v outfile="$tmp_out" -v listout="$tmp_list" '
+        function norm(s) { sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, "", s); sub(/\/+$/, "", s); return s }
+        function ismatch(uri,   r, b) {
+            r = norm(repo); b = norm(uri)
+            return (b == r || index(r "/", b "/") == 1)
+        }
+        {
+            line = $0
+            if (line !~ /^[ \t]*deb(-src)?[ \t]/) { print line > listout; next }
+            # Guardar copia comentada de la línea original
+            print "# launchpad-getkeys (deb822): " line > listout
+
+            n = split(line, tok, /[ \t]+/)
+            i = 2
+            delete opt
+            nopt = 0
+            if (tok[i] ~ /^\[/) {
+                opts = tok[i]
+                while (opts !~ /\]$/ && i < n) { i++; opts = opts " " tok[i] }
+                gsub(/^\[|\]$/, "", opts)
+                nopt = split(opts, opt, /[ \t]+/)
+                i++
+            }
+            uri = tok[i]; suite = tok[i+1]
+            comps = ""
+            for (j = i+2; j <= n; j++) comps = (comps == "" ? tok[j] : comps " " tok[j])
+            if (!ismatch(uri)) { print line > listout; next }
+
+            types = (tok[1] == "deb-src") ? "deb-src" : "deb"
+            arch = ""; trusted = ""
+            for (j = 1; j <= nopt; j++) {
+                if (opt[j] ~ /^arch=/)     { arch = opt[j];    sub(/^arch=/, "", arch) }
+                if (opt[j] ~ /^trusted=/)  { trusted = opt[j]; sub(/^trusted=/, "", trusted) }
+            }
+
+            print "Types: " types > outfile
+            print "URIs: " uri > outfile
+            print "Suites: " suite > outfile
+            if (comps != "") print "Components: " comps > outfile
+            if (arch != "") print "Architectures: " arch > outfile
+            if (trusted != "" && trusted != "no") print "Trusted: " trusted > outfile
+            print "Signed-By: " keyring > outfile
+            print "" > outfile
+            converted = 1
+        }
+        END { exit (converted ? 0 : 1) }
+    ' "$listfile"
+    local rc=$?
+
+    if [ $rc -eq 0 ]; then
+        mv "$tmp_list" "$listfile"
+        cat "$tmp_out" >> "$outfile"
+        if [ -s "$outfile" ]; then
+            echo -e "${GREEN}✔ Entradas de $listfile convertidas a deb822 en $outfile${NC}"
+        fi
+    else
+        rm -f "$tmp_list"
+    fi
+    rm -f "$tmp_out"
+}
+
+# Referencia el keyring descargado en los archivos de fuentes:
+#  - .sources: añade Signed-By a las stanzas que correspondan
+#  - .list / sources.list: convierte las entradas afectadas a deb822
+reference_key_in_sources() {
+    local repo="$1" keyring="$2" f
+
+    for f in "$SOURCES_LIST_D"/*.sources; do
+        [ -f "$f" ] && add_signed_by "$f" "$repo" "$keyring"
+    done
+
+    for f in /etc/apt/sources.list "$SOURCES_LIST_D"/*.list; do
+        [ -f "$f" ] && convert_list_entries "$f" "$repo" "$keyring"
+    done
+}
+
+# Limpieza de /etc/apt/trusted.gpg.d:
+#  - Elimina los .asc en texto plano (no se usan como keyrings de confianza)
+#  - Elimina los keyrings binarios cuyas claves ya están en /usr/share/keyrings
+#    y están referenciadas por algún .sources (Signed-By). Si una clave no está
+#    referenciada, el keyring se conserva y se avisa, para no romper apt.
+clean_trusted_gpg_d() {
+    local dir="/etc/apt/trusted.gpg.d"
+    local f fpr keyfile sb sbfile mimetype allsafe fp
+    [ -d "$dir" ] || return 0
+    echo -e "${CYAN}Cleaning $dir...${NC}"
+
+    # Huellas de las claves realmente referenciadas desde .sources (Signed-By)
+    # Primero: reapuntar a $KEYRING_DIR las referencias que aún apuntan a
+    # keyrings de trusted.gpg.d que ya han sido migrados, para no dejar
+    # referencias colgantes al borrarlos.
+    for f in "$dir"/*; do
+        [ -f "$f" ] || continue
+        dst="$KEYRING_DIR/$(basename "$f")"
+        [ -f "$dst" ] || continue
+        if grep -rl -F "$f" /etc/apt/sources.list "$SOURCES_LIST_D"/*.sources 2>/dev/null | grep -q .; then
+            sed -i -e "s#Signed-By:[[:space:]]*$f#Signed-By: $dst#" -e "s#signed-by=$f#signed-by=$dst#" \
+                /etc/apt/sources.list "$SOURCES_LIST_D"/*.sources 2>/dev/null
+            echo -e "${GREEN}✔ Signed-By references to $f repointed to $dst${NC}"
+        fi
+    done
+
+    REFERENCED_FPRS=$(mktemp)
+    for sb in $(grep -h -i '^[[:space:]]*Signed-By:' /etc/apt/sources.list.d/*.sources /etc/apt/sources.list 2>/dev/null | sed 's/^[^:]*:[[:space:]]*//'); do
+        # Las referencias a trusted.gpg.d no cuentan: ahí el keyring va a ser eliminado
+        [[ "$sb" == "$dir"/* || "$sb" == "/etc/apt/trusted.gpg" ]] && continue
+        if [ -d "$sb" ]; then
+            for sbfile in "$sb"/*; do
+                [ -f "$sbfile" ] && LC_ALL=C gpg --no-default-keyring --keyring="$sbfile" --with-colons --list-keys 2>/dev/null | awk -F: '/^fpr/{print $10}' >> "$REFERENCED_FPRS"
+            done
+        elif [ -f "$sb" ]; then
+            LC_ALL=C gpg --no-default-keyring --keyring="$sb" --with-colons --list-keys 2>/dev/null | awk -F: '/^fpr/{print $10}' >> "$REFERENCED_FPRS"
+        fi
+    done
+    sort -u "$REFERENCED_FPRS" -o "$REFERENCED_FPRS"
+
+    for f in "$dir"/*; do
+        [ -f "$f" ] || continue
+        mimetype=$(file --mime "$f" 2>/dev/null)
+        if [[ "$mimetype" != *"charset=binary"* ]]; then
+            echo -e "${CYAN}Removing ASCII key file $f (not usable as trusted keyring)${NC}"
+            rm -f "$f"
+            continue
+        fi
+        # Comprobar que TODAS las claves del keyring están en /usr/share/keyrings
+        # y referenciadas desde algún .sources
+        allsafe="yes"
+        while read -r fpr; do
+            [ -z "$fpr" ] && continue
+            found=""
+            for keyfile in "$KEYRING_DIR"/*.gpg; do
+                [ -f "$keyfile" ] || continue
+                if LC_ALL=C gpg --no-default-keyring --keyring="$keyfile" --with-colons --list-keys 2>/dev/null | grep -q "$fpr"; then
+                    found="$keyfile"
+                    break
+                fi
+            done
+            if [ -z "$found" ]; then
+                allsafe="no"
+                break
+            fi
+            if ! grep -q "^$fpr$" "$REFERENCED_FPRS"; then
+                echo -e "${CYAN}Key $fpr exists in $found but is not referenced by any .sources (Signed-By). Keeping $f.${NC}"
+                allsafe="no"
+                break
+            fi
+        done < <(LC_ALL=C gpg --no-default-keyring --keyring="$f" --with-colons --list-keys 2>/dev/null | awk -F: '/^fpr/{print $10}')
+
+        if [[ "$allsafe" == "yes" ]]; then
+            echo -e "${GREEN}All keys in $f are already present and referenced in $KEYRING_DIR. Removing $f${NC}"
+            rm -f "$f"
+        fi
+    done
+    rm -f "$REFERENCED_FPRS"
+}
+
+# Elimina los ficheros .gpg de /usr/share/keyrings y /etc/apt/keyrings que no
+# estén referenciados en ningún .sources (Signed-By) ni .list (signed-by=),
+# protegiendo aquellos que pertenecen a paquetes instalados del sistema (dpkg -S).
+remove_unreferenced_keyrings() {
+    local ref_list dir kf real_kf entry resolved
+    echo -e "${CYAN}Checking for unreferenced .gpg keyring files...${NC}"
+    ref_list=$(mktemp)
+
+    # 1. Extraer rutas referenciadas en .sources (Signed-By:) y .list (signed-by=)
+    {
+        grep -h -i '^[[:space:]]*Signed-By:' /etc/apt/sources.list "$SOURCES_LIST_D"/*.sources 2>/dev/null \
+            | sed 's/^[^:]*:[[:space:]]*//' | tr ', ' '\n'
+        grep -h -i '^[[:space:]]*deb' /etc/apt/sources.list "$SOURCES_LIST_D"/*.list 2>/dev/null \
+            | grep -Eo 'signed-by=[^] ,]+' | sed 's/^signed-by=//'
+    } | while read -r entry; do
+        [ -z "$entry" ] && continue
+        if [ -d "$entry" ]; then
+            for f in "$entry"/*.gpg; do
+                [ -e "$f" ] && readlink -f "$f"
+            done
+        elif [ -e "$entry" ]; then
+            readlink -f "$entry"
+        else
+            echo "$entry"
+        fi
+    done | sort -u > "$ref_list"
+
+    # 2. Revisar los .gpg en /usr/share/keyrings y /etc/apt/keyrings
+    for dir in "$KEYRING_DIR" "/etc/apt/keyrings"; do
+        [ -d "$dir" ] || continue
+        for kf in "$dir"/*.gpg; do
+            [ -f "$kf" ] || continue
+            real_kf=$(readlink -f "$kf")
+
+            # Proteger keyrings gestionados por paquetes oficiales/instalados
+            if dpkg -S "$kf" >/dev/null 2>&1 || dpkg -S "$real_kf" >/dev/null 2>&1; then
+                continue
+            fi
+
+            # Si no está en la lista de referenciados, eliminarlo
+            if ! grep -Fxq "$real_kf" "$ref_list" && ! grep -Fxq "$kf" "$ref_list"; then
+                echo -e "${GREEN}Removing unreferenced keyring file: $kf${NC}"
+                rm -f "$kf"
+            fi
+        done
+    done
+
+    rm -f "$ref_list"
+}
+
+# Comprueba qué keyring de /etc/apt/trusted.gpg.d firma el InRelease del
+# repositorio indicado. Imprime la ruta del keyring si lo encuentra.
+find_keyring_for_repo() {
+    local uri="$1" suite="$2"
+    local url tmp kf kfbin mimetype
+    if [[ "$suite" == "./" || "$suite" == "." || "$suite" == */ ]]; then
+        url="${uri%/}/InRelease"
+    else
+        url="${uri%/}/dists/${suite}/InRelease"
+    fi
+    tmp=$(mktemp)
+    if ! wget -q --timeout=15 -O "$tmp" "$url" || [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        return 1
+    fi
+    for kf in /etc/apt/trusted.gpg.d/*; do
+        [ -f "$kf" ] || continue
+        kfbin="$kf"
+        mimetype=$(file --mime "$kf" 2>/dev/null)
+        if [[ "$mimetype" != *"charset=binary"* ]]; then
+            kfbin=$(mktemp)
+            gpg --yes --dearmor -o "$kfbin" "$kf" >/dev/null 2>&1 || { rm -f "$kfbin"; continue; }
+        fi
+        if gpgv --keyring "$kfbin" "$tmp" >/dev/null 2>&1; then
+            [ "$kfbin" != "$kf" ] && rm -f "$kfbin"
+            rm -f "$tmp"
+            echo "$kf"
+            return 0
+        fi
+        [ "$kfbin" != "$kf" ] && rm -f "$kfbin"
+    done
+    rm -f "$tmp"
+    return 1
+}
+
+# Mueve un keyring de trusted.gpg.d a /usr/share/keyrings. Si ya existe uno
+# con el mismo nombre, concatena los paquetes y elimina el original.
+migrate_keyring() {
+    local src="$1"
+    local dst="$KEYRING_DIR/$(basename "$1")"
+    if [ "$src" != "$dst" ]; then
+        if [ -e "$dst" ]; then
+            cat "$src" >> "$dst"
+            rm -f "$src"
+        else
+            mv "$src" "$dst"
+            chmod 644 "$dst"
+        fi
+        echo -e "${GREEN}✔ Keyring moved to $dst${NC}"
+    fi
+    echo "$dst"
+}
+
+# Conversión proactiva (-c): para cada entrada de fuentes sin Signed-By,
+# descubre qué keyring de trusted.gpg.d firma su InRelease, migra el keyring
+# a /usr/share/keyrings, referencia las entradas (convirtiendo a deb822 las
+# one-line) y limpia trusted.gpg.d.
+proactive_convert() {
+    local f line uri suite kf dst mappings
+    echo -e "${CYAN}Proactive conversion to deb822...${NC}"
+    mappings=$(mktemp)
+
+    # Entradas one-line (.list y sources.list) sin signed-by=
+    for f in /etc/apt/sources.list "$SOURCES_LIST_D"/*.list; do
+        [ -f "$f" ] || continue
+        while read -r uri suite; do
+            [ -n "$uri" ] && [ -n "$suite" ] || continue
+            if kf=$(find_keyring_for_repo "$uri" "$suite"); then
+                dst=$(migrate_keyring "$kf")
+                echo "${uri}|${dst}" >> "$mappings"
+            fi
+        done < <(awk '
+            {
+                if ($0 !~ /^[ \t]*deb(-src)?[ \t]/) next
+                if ($0 ~ /signed-by=/) next
+                line = $0; sub(/^[ \t]*/, "", line)
+                n = split(line, t, /[ \t]+/)
+                i = 2
+                if (t[i] ~ /^\[/) { while (t[i] !~ /\]$/ && i < n) i++; i++ }
+                if (i < n) print t[i], t[i+1]
+            }' "$f")
+    done
+
+    # Stanzas deb822 (.sources) sin Signed-By
+    for f in "$SOURCES_LIST_D"/*.sources; do
+        [ -f "$f" ] || continue
+        while read -r uri suite; do
+            [ -n "$uri" ] && [ -n "$suite" ] || continue
+            if kf=$(find_keyring_for_repo "$uri" "$suite"); then
+                dst=$(migrate_keyring "$kf")
+                echo "${uri}|${dst}" >> "$mappings"
+            fi
+        done < <(awk '
+            function flush() {
+                if (instanza && hasuris && hassuite && !hassb) {
+                    n = split(uris, u, /[ \t]+/)
+                    for (i = 1; i <= n; i++) if (u[i] != "") print u[i], suite
+                }
+                instanza = 0; hasuris = 0; hassuite = 0; hassb = 0
+            }
+            /^[ \t]*$/ { flush(); next }
+            {
+                if ($0 ~ /^[ \t]*[Tt]ypes:/) { flush(); instanza = 1 }
+                else if ($0 ~ /^[ \t]*[Uu][Rr][Ii][Ss]:/) { uris = $0; sub(/^[^:]*:[ \t]*/, "", uris); sub(/^[Uu][Rr][Ii][Ss]:[ \t]*/, "", uris); hasuris = 1 }
+                else if ($0 ~ /^[ \t]*[Ss]uites:/) { suite = $0; sub(/^[Ss]uites:[ \t]*/, "", suite); split(suite, s, /[ \t]+/); suite = s[1]; hassuite = 1 }
+                else if ($0 ~ /^[ \t]*[Ss]igned-[Bb]y:/) hassb = 1
+            }
+            END { flush() }' "$f")
+    done
+
+    # Referenciar cada repositorio con su keyring migrado
+    if [ -s "$mappings" ]; then
+        while IFS='|' read -r uri dst; do
+            [ -n "$uri" ] || continue
+            echo -e "${CYAN}==> Referencing $uri with $dst${NC}"
+            reference_key_in_sources "$uri" "$dst"
+        done < <(sort -u "$mappings")
+    else
+        echo -e "${CYAN}No repositories found depending on /etc/apt/trusted.gpg.d.${NC}"
+    fi
+    rm -f "$mappings"
+
+    # Eliminar los .list que hayan quedado sin entradas activas
+    remove_empty_list_files
+
+    # Limpieza final: los keyrings ya migrados y referenciados se eliminan
+    clean_trusted_gpg_d
+}
+
+# Elimina los archivos .list de /etc/apt/sources.list.d que ya no contengan
+# ninguna entrada de repositorio activa (solo comentarios o líneas vacías),
+# es decir, cuando todas sus entradas se han convertido a .sources
+remove_empty_list_files() {
+    local f
+    for f in "$SOURCES_LIST_D"/*.list; do
+        [ -f "$f" ] || continue
+        if ! grep -Eq '^[[:space:]]*deb(-src)?[[:space:]]' "$f"; then
+            echo -e "${CYAN}Removing $f (all entries converted to deb822)${NC}"
+            rm -f "$f"
+        fi
+    done
+}
+
 function download_key_from_known_sources() {
     local keyid="$1"
     local target="$2"
@@ -123,44 +564,49 @@ function download_key_from_known_sources() {
     # echo -e "${CYAN}Trying to download key ${keyid} from known sources...${NC}"
 
     case "$keyid" in
+        # Microsoft (packages.microsoft.com: VS Code, Teams, etc.)
+        EB3E94ADBE1229CF)
+            wget -qO- https://packages.microsoft.com/keys/microsoft.asc | gpg --yes --dearmor | tee "$target" > /dev/null 2>&1
+            ;;
+
         # Oracle VirtualBox
         A2F683C52980AECF)
-            wget -qO- https://www.virtualbox.org/download/oracle_vbox_2016.asc | gpg --yes --output /usr/share/keyrings/oracle-virtualbox-2016.gpg --dearmor > /dev/null 2>&1
+            wget -qO- https://www.virtualbox.org/download/oracle_vbox_2016.asc | gpg --yes --output "$target" --dearmor > /dev/null 2>&1
             ;;
 
         # Steven Pusser (Firefox / Thunderbird)
         0FAD31CA8719FCE4)
-            wget -qO- "https://build.opensuse.org/projects/home:stevenpusser/signing_keys/download?kind=gpg" | gpg --yes --output /etc/apt/trusted.gpg.d/home_stevenpusser.gpg --dearmor > /dev/null 2>&1
+            wget -qO- "https://build.opensuse.org/projects/home:stevenpusser/signing_keys/download?kind=gpg" | gpg --yes --output "$target" --dearmor > /dev/null 2>&1
             ;;
 
         # Waydroid
         0E406D181DCEE19C)
-            wget -q --https-only --secure-protocol=TLSv1_2 -O /usr/share/keyrings/waydroid.gpg https://repo.waydro.id/waydroid.gpg
+            wget -q --https-only --secure-protocol=TLSv1_2 -O "$target" https://repo.waydro.id/waydroid.gpg
             ;;
 
         # Ookla (Speedtest)
         8E61C2AB9A6D1557)
-            wget -qO- https://packagecloud.io/ookla/speedtest-cli/gpgkey | gpg --yes --output /usr/share/keyrings/ookla_speedtest-cli-archive-keyring.gpg --dearmor > /dev/null 2>&1
+            wget -qO- https://packagecloud.io/ookla/speedtest-cli/gpgkey | gpg --yes --output "$target" --dearmor > /dev/null 2>&1
             ;;
 
         # NodeSource
         1655A0AB68576280)
-            wget -qO- https://deb.nodesource.com/gpgkey/nodesource.gpg.key | gpg --yes --dearmor | tee /usr/share/keyrings/nodesource.gpg > /dev/null 2>&1
+            wget -qO- https://deb.nodesource.com/gpgkey/nodesource.gpg.key | gpg --yes --dearmor | tee "$target" > /dev/null 2>&1
             ;;
 
         # HashiCorp
         AA16FCBCA621E701)
-            wget -qO- https://apt.releases.hashicorp.com/gpg | gpg --yes --dearmor | tee /usr/share/keyrings/hashicorp-archive-keyring.gpg > /dev/null 2>&1
+            wget -qO- https://apt.releases.hashicorp.com/gpg | gpg --yes --dearmor | tee "$target" > /dev/null 2>&1
             ;;
 
         # Docker
         7EA0A9C3F273FCD8)
-            wget -qO- https://download.docker.com/linux/ubuntu/gpg | gpg --yes --dearmor | tee /usr/share/keyrings/docker-archive-keyring.gpg > /dev/null 2>&1
+            wget -qO- https://download.docker.com/linux/ubuntu/gpg | gpg --yes --dearmor | tee "$target" > /dev/null 2>&1
             ;;
 
         # Netdata
         54832F89F09FED90)
-            curl -fsSL https://packagecloud.io/netdata/netdata/gpgkey | gpg --yes --dearmor > /etc/apt/trusted.gpg.d/netdata_netdata.gpg
+            curl -fsSL https://packagecloud.io/netdata/netdata/gpgkey | gpg --yes --dearmor > "$target"
             ;;
 
         # Tailscale
@@ -168,7 +614,7 @@ function download_key_from_known_sources() {
             local distro codename
             distro=$(grep '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"')
             codename=$(lsb_release -cs)
-            wget -qO- "https://pkgs.tailscale.com/stable/${distro}/${codename}.noarmor.gpg" | tee /usr/share/keyrings/tailscale-archive-keyring.gpg > /dev/null 2>&1
+            wget -qO- "https://pkgs.tailscale.com/stable/${distro}/${codename}.noarmor.gpg" | tee "$target" > /dev/null 2>&1
             ;;
 
         # Unknown
@@ -184,14 +630,16 @@ if [[ $(whoami) != root ]]; then
 fi
 
 REMOVE_EXPIRED_KEYS="no"
+PROACTIVE_CONVERT="no"
 
 [ -s /etc/default/launchpad-getkeys ] && . /etc/default/launchpad-getkeys
 
-while getopts "k:p:rhf\?" opt; do
+while getopts "k:p:rchf\?" opt; do
     case "$opt" in
         k ) KEYSERVER="$OPTARG" ;;
         p ) PROXY="$OPTARG" ;;
         r ) REMOVE_EXPIRED_KEYS="yes" ;;
+        c ) PROACTIVE_CONVERT="yes" ;;
         f ) FORCE_UPDATE=1 ;;
         h | \? ) HELP ;;
     esac
@@ -241,13 +689,20 @@ DISTRO_ID=$(grep '^ID=' /etc/os-release | cut -d'=' -f2 | tr -d '"')
 
 # Ejecutar instalación condicional
 install_keyring_if_missing "$DISTRO_ID"
-mkdir -p "$KEYRING_DIR"
+mkdir -p "$KEYRING_DIR" "$SOURCES_LIST_D"
 
-# Remove previous automatic import files
-OLD_FILES=( $(find "$KEYRING_DIR" -maxdepth 1 -type f -name 'launchpad-getkeys_imported____*') )
-if [[ ${#OLD_FILES[@]} -gt 0 ]]; then
-    echo -e "${CYAN}Deleting ${#OLD_FILES[@]} old 'launchpad-getkeys_imported____*' file(s)...${NC}"
-    rm -f "${OLD_FILES[@]}"
+# Remove previous automatic import files (keyrings and their .sources references,
+# both in the old trusted.gpg.d location and the new keyrings location)
+OLD_FILES=( $(find "$KEYRING_DIR" /etc/apt/trusted.gpg.d -maxdepth 1 -type f -name 'launchpad-getkeys_imported____*' 2>/dev/null) )
+OLD_SOURCES=( $(find "$SOURCES_LIST_D" -maxdepth 1 -type f -name 'launchpad-getkeys_imported____*.sources' 2>/dev/null) )
+if [[ ${#OLD_FILES[@]} -gt 0 || ${#OLD_SOURCES[@]} -gt 0 ]]; then
+    echo -e "${CYAN}Deleting ${#OLD_FILES[@]} old keyring file(s) and ${#OLD_SOURCES[@]} old .sources file(s)...${NC}"
+    rm -f "${OLD_FILES[@]}" "${OLD_SOURCES[@]}"
+fi
+
+# Conversión proactiva a deb822 (opción -c), antes de detectar claves ausentes
+if [[ "$PROACTIVE_CONVERT" == "yes" ]]; then
+    proactive_convert
 fi
 
 echo -e "${GREEN}\nRunning apt-get update to detect missing GPG keys...${NC}"
@@ -265,7 +720,8 @@ while read -r repo keys; do
     repo_clean="${repo_clean#https://}"
     repo_clean="${repo_clean//\//-}"
     repo_clean="${repo_clean%-InRelease}"
-    current_repo="$KEYRING_DIR/$repo_clean.gpg"
+    # deb822: las claves se guardan en /usr/share/keyrings, no en trusted.gpg.d
+    current_repo="$KEYRING_DIR/launchpad-getkeys_imported____$repo_clean.gpg"
 
     echo -e "${CYAN}==> Processing repository: ${repo}${NC}"
     echo -e "${CYAN}    Keys: ${keys}${NC}"
@@ -299,13 +755,26 @@ while read -r repo keys; do
         rm -f "$TMP_KEYRING"
     done
 
-    # Final validation: ensure file is valid GPG
-    if gpg --no-default-keyring --keyring "$current_repo" --list-keys >/dev/null 2>&1; then
+    # Final validation: ensure file is valid GPG and reference it from the sources
+    if [ -f "$current_repo" ] && gpg --no-default-keyring --keyring "$current_repo" --list-keys >/dev/null 2>&1; then
+        chmod 644 "$current_repo"
         echo -e "${GREEN}✔ Key(s) successfully saved in ${current_repo}${NC}"
+
+        # deb822: referenciar el keyring desde el archivo de fuentes del repositorio
+        reference_key_in_sources "$repo" "$current_repo"
     else
         echo -e "${RED}✖ Failed to save key(s) for ${repo}${NC}"
     fi
 done | tee /var/log/launchpad-getkeys.log
+
+# Si todas las entradas de algún .list se convirtieron a deb822, eliminarlo
+remove_empty_list_files
+
+# Limpieza final de /etc/apt/trusted.gpg.d (tras importar y referenciar)
+clean_trusted_gpg_d
+
+# Eliminar ficheros .gpg de /usr/share/keyrings y /etc/apt/keyrings que ya no estén referenciados
+remove_unreferenced_keyrings
 
 echo -e "${GREEN}\nDone. Run 'sudo apt-get update' again to verify that no key errors remain.${NC}"
 #rm -f "$UPDATE_LOG"
